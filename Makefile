@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: up down rebuild logs ps psql redis-shell api-shell tail
+.PHONY: up down rebuild logs ps psql redis-shell api-shell tail alembic-rev alembic-up
 
 up:
 	 docker compose up -d
