@@ -1,3 +1,9 @@
+import os
+import psycopg
+# psycopg needs a plain 'postgresql://' DSN (no '+psycopg')
+DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql+psycopg://cgv:cgv@db:5432/cgv')
+DSN = DATABASE_URL.replace('postgresql+psycopg://', 'postgresql://', 1)
+
 from db import engine
 from sqlalchemy import text
 from db import get_db, engine
@@ -9,6 +15,7 @@ import os
 import time
 import psycopg
 import redis
+
 
 # Prometheus metrics
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -25,7 +32,6 @@ app.add_middleware(
 )
 
 # ---------- connection helpers ----------
-DSN = os.getenv("DATABASE_URL", "postgresql://cgv:cgv@db:5432/cgv")
 RURL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 _r = redis.from_url(RURL)
 
