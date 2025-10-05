@@ -4,5 +4,6 @@ psycopg[binary]==3.2.1
 redis==5.0.8
 pydantic==2.9.2
 prometheus_client==0.20.0
-prometheus_client==0.20.0
-prometheus_client==0.20.0
+
+SQLAlchemy==2.0.35
+alembic==1.13.2

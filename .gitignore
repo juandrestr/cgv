@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 db-data/
+
+# temp
+*.save
+__pycache__/
+api/migrations/__pycache__/

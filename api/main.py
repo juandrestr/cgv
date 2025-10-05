@@ -1,3 +1,5 @@
+from sqlalchemy import text
+from db import get_db, engine
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel

@@ -27,6 +27,8 @@ services:
       retries: 20
 
   api:
+    environment:
+      - DATABASE_URL=postgresql+psycopg://cgv:cgv@db:5432/cgv
     build:
       context: ./api
     env_file:
