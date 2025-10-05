@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-DEFAULT_URL = "postgresql+psycopg://postgres:postgres@db:5432/postgres"
+DEFAULT_URL = "postgresql+psycopg://cgv:cgv@db:5432/cgv"
 url = os.getenv("DATABASE_URL", DEFAULT_URL)
 if url.startswith("postgresql://"):
     url = url.replace("postgresql://", "postgresql+psycopg://", 1)
