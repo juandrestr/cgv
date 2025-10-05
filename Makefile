@@ -31,11 +31,7 @@ tail:
 	 curl -s http://127.0.0.1:8080/version && echo
 	 curl -s http://127.0.0.1:8080/metrics | head -n 12
 
-\t  -e DATABASE_URL="postgresql+psycopg://cgv:cgv@db:5432/cgv" \
-\t  -v $(PWD)/api:/app -w /app cgv-api alembic revision --autogenerate -m "$(m)"
 
-\t  -e DATABASE_URL="postgresql+psycopg://cgv:cgv@db:5432/cgv" \
-\t  -v $(PWD)/api:/app -w /app cgv-api alembic upgrade head
 
 alembic-rev:
 	 docker run --rm --network cgv_default \
