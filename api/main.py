@@ -1,3 +1,4 @@
+from db import engine
 from sqlalchemy import text
 from db import get_db, engine
 from fastapi import FastAPI, Request, Response
@@ -83,7 +84,7 @@ async def basic_rate_limit(request: Request, call_next):
     return await call_next(request)
 
 # ---------- startup: ensure schema ----------
-@app.on_event("startup")
+
 def ensure_schema():
     ddl = """
     CREATE TABLE IF NOT EXISTS notes(
@@ -202,3 +203,17 @@ def cache_get(key: str):
     if val is None:
         return {"ok": False, "key": key, "value": None}
     return {"ok": True, "key": key, "value": val.decode("utf-8")}
+
+@app.on_event("startup")
+def ensure_schema():
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS notes (
+                    id SERIAL PRIMARY KEY,
+                    msg TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """))
+    except Exception as e:
+        print(f"[startup] schema ensure failed: {e}")
