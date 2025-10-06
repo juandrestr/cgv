@@ -339,3 +339,14 @@ def auth_logout(body: LogoutIn):
         raise HTTPException(status_code=500, detail="redis_not_configured")
     delete_refresh_jti(r, user_id, jti)
     return {"status": "ok"}
+
+# ---------- Logout all sessions ----------
+@app.post("/auth/logout_all")
+def logout_all(user: MeOut = Depends(get_current_user)):
+    uid = user.email
+    # remove all refresh tokens for this user
+    for raw in r.smembers(f"refresh:index:{uid}") or []:
+        jti = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+        r.delete(f"refresh:{uid}:{jti}")
+    r.delete(f"refresh:index:{uid}")
+    return {"status": "ok"}
