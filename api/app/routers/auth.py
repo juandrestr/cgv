@@ -35,3 +35,9 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         return user
     except JWTError:
         raise credentials_exception
+
+@router.get("/me")
+def auth_me(current=Depends(get_current_user)):
+    # mirrors /users/me but lives under /auth
+    from ..schemas.user import UserOut
+    return UserOut.model_validate(current)

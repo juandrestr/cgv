@@ -25,3 +25,9 @@ def create_user_admin(
     require_admin(current)
     user = create_user(db, payload.email, payload.password, roles=(), is_superuser=False)
     return user
+
+@router.get("/admin/ping")
+def admin_ping(current: User = Depends(get_current_user)):
+    from ..guards import require_roles
+    require_roles(current, "admin")
+    return {"ok": True}
