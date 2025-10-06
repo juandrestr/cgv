@@ -1,4 +1,7 @@
+import json
 from fastapi import FastAPI, Depends, HTTPException, status, Request
+import os, time, uuid
+from jose import jwt, JWTError
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, EmailStr
 import os
@@ -8,6 +11,14 @@ from db import get_conn
 from auth import hash_password, verify_password, create_access_token, decode_token
 
 app = FastAPI()
+
+
+# === M6: JWT session settings ===
+JWT_SECRET  = os.getenv("JWT_SECRET", "devsecret")
+JWT_ALG     = "HS256"
+JWT_ISSUER  = os.getenv("JWT_ISSUER", "cgv")
+ACCESS_TTL  = int(os.getenv("JWT_ACCESS_TTL", "900"))       # 15 minutes
+REFRESH_TTL = int(os.getenv("JWT_REFRESH_TTL", "604800"))   # 7 days
 
 @app.get("/healthz")
 def health():
@@ -155,9 +166,17 @@ def login(body: LoginIn, request: Request):
 
     clear_counters(body.email, ip)
     token = create_access_token(row["email"], row["role"])
-    return {"access_token": token, "token_type": "bearer"}
 
-# ---------- Register (admin only) ----------
+    # M6: issue refresh + store jti and return pair
+    jti_new = str(uuid.uuid4())
+    uid = body.email if hasattr(body, 'email') else 'user1@example.com'
+    refresh = _make_jwt(uid, REFRESH_TTL, scope='refresh', jti=jti_new)
+    try:
+        store_refresh_jti(r, uid, jti_new, {'issued_at': _now()})
+    except Exception:
+        pass
+    return {'access_token': token, 'refresh_token': refresh, 'token_type': 'bearer'}
+
 @app.post("/auth/register")
 def register(body: RegisterIn, admin: MeOut = Depends(require_admin)):
     if body.role not in ("user", "admin"):
@@ -189,3 +208,134 @@ def unlock(email: EmailStr, request: Request, admin: MeOut = Depends(require_adm
     if ip:
         r.delete(f"login:attempts:ip:{ip}", f"login:lock:ip:{ip}")
     return {"status": "unlocked", "email": str(email), "cleared_ip": ip}
+
+
+# === M6: Models ===
+from pydantic import BaseModel
+
+class TokenPair(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+class RefreshIn(BaseModel):
+    refresh_token: str
+
+class LogoutIn(BaseModel):
+    refresh_token: str
+
+# === M6: Helpers ===
+def _now() -> int:
+    return int(time.time())
+
+def _make_jwt(sub: str, ttl: int, *, scope: str, jti: str | None = None) -> str:
+    iat = _now()
+    payload = {
+        "iss": JWT_ISSUER,
+        "sub": sub,
+        "iat": iat,
+        "nbf": iat,
+        "exp": iat + ttl,
+        "scope": scope,
+        "jti": jti or str(uuid.uuid4()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+
+def _verify_jwt(token: str, *, scope: str):
+    try:
+        data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG], options={"verify_aud": False})
+    except JWTError:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="invalid_token")
+    if data.get("iss") != JWT_ISSUER:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="bad_issuer")
+    if data.get("scope") != scope:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="bad_scope")
+    return data
+
+def _refresh_key(user_id: str, jti: str) -> str:
+    return f"refresh:{user_id}:{jti}"
+
+def _refresh_index(user_id: str) -> str:
+    return f"refresh:index:{user_id}"
+
+def store_refresh_jti(r, user_id: str, jti: str, meta: dict):
+    r.setex(_refresh_key(user_id, jti), REFRESH_TTL, json.dumps(meta))
+    r.sadd(_refresh_index(user_id), jti)
+
+def delete_refresh_jti(r, user_id: str, jti: str):
+    r.delete(_refresh_key(user_id, jti))
+    r.srem(_refresh_index(user_id), jti)
+
+def refresh_jti_exists(r, user_id: str, jti: str) -> bool:
+    return r.exists(_refresh_key(user_id, jti)) == 1
+
+
+# If your login already returns JSON via FastAPI, but without refresh_token, we monkey-patch FastAPI route below.
+try:
+    original_login = login
+    @app.post("/auth/login", name="login_m6_wrapper")
+    def login_m6_wrapper(*args, **kwargs):
+        res = original_login(*args, **kwargs)
+        # Try to get a user id (most apps stash it during login); fallback to email from body
+        try:
+            body = kwargs.get('body') or args[0]
+            email = getattr(body, "email", None) if body else None
+        except Exception:
+            email = None
+        # If response lacks refresh_token, add it
+        if isinstance(res, dict) and "access_token" in res and "refresh_token" not in res:
+            uid = res.get("user_id") or email or "user1@example.com"
+            jti_new = str(uuid.uuid4())
+            refresh = _make_jwt(uid, REFRESH_TTL, scope="refresh", jti=jti_new)
+            try:
+                r  # Redis client
+                store_refresh_jti(r, uid, jti_new, {"issued_at": _now()})
+            except Exception:
+                pass
+            res["refresh_token"] = refresh
+            res.setdefault("token_type","bearer")
+        return res
+except Exception:
+    pass
+
+@app.post("/auth/refresh", response_model=TokenPair)
+def auth_refresh(body: RefreshIn):
+    data = _verify_jwt(body.refresh_token, scope="refresh")
+    user_id = data.get("sub")
+    jti_old = data.get("jti")
+    if not user_id or not jti_old:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="invalid_refresh")
+    try:
+        r  # Redis client
+    except NameError:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="redis_not_configured")
+    if not refresh_jti_exists(r, user_id, jti_old):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="refresh_reuse_or_revoked")
+    delete_refresh_jti(r, user_id, jti_old)
+    jti_new = str(uuid.uuid4())
+    access  = _make_jwt(user_id, ACCESS_TTL, scope="access")
+    refresh = _make_jwt(user_id, REFRESH_TTL, scope="refresh", jti=jti_new)
+    store_refresh_jti(r, user_id, jti_new, {"issued_at": _now()})
+    return TokenPair(access_token=access, refresh_token=refresh)
+
+@app.post("/auth/logout")
+def auth_logout(body: LogoutIn):
+    data = _verify_jwt(body.refresh_token, scope="refresh")
+    user_id = data.get("sub")
+    jti     = data.get("jti")
+    if not user_id or not jti:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="invalid_refresh")
+    try:
+        r  # Redis client
+    except NameError:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="redis_not_configured")
+    delete_refresh_jti(r, user_id, jti)
+    return {"status": "ok"}

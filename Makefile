@@ -2,6 +2,7 @@
 
 smoke:
 	./smoke_test_m1_m5.sh
+	./smoke_test_m6.sh
 
 up:
 	docker compose up -d --force-recreate api
