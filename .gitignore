@@ -17,3 +17,8 @@ api/alembic/__pycache__/
 api/Dockerfile.bak
 
 .env
+
+# Compose backups / temp
+*.bak.*
+*.fixed
+*.new
