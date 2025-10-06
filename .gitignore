@@ -15,3 +15,5 @@ api/__pycache__/
 api/alembic/__pycache__/
 # backups
 api/Dockerfile.bak
+
+.env
