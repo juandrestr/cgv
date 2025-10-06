@@ -1,13 +1,13 @@
+from app.routers.notes import router as notes_router
 import os
 import psycopg
 # psycopg needs a plain 'postgresql://' DSN (no '+psycopg')
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql+psycopg://cgv:cgv@db:5432/cgv')
 DSN = DATABASE_URL.replace('postgresql+psycopg://', 'postgresql://', 1)
 
-from db import engine
 from sqlalchemy import text
-from db import get_db, engine
 from fastapi import FastAPI, Request, Response
+from app.routers import auth, users
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -21,6 +21,7 @@ import redis
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 app = FastAPI()
+app.include_router(notes_router, prefix="/notes", tags=["notes"])
 
 # ---------- CORS ----------
 app.add_middleware(
@@ -223,3 +224,7 @@ def ensure_schema():
             """))
     except Exception as e:
         print(f"[startup] schema ensure failed: {e}")
+
+# M4: mount routers
+app.include_router(auth.router)
+app.include_router(users.router)

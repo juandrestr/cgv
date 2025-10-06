@@ -1,37 +1,10 @@
-import os
-from contextlib import contextmanager
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import sessionmaker, declarative_base
 
-DEFAULT_URL = "postgresql+psycopg://cgv:cgv@db:5432/cgv"
-url = os.getenv("DATABASE_URL", DEFAULT_URL)
-if url.startswith("postgresql://"):
-    url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+# Uses DATABASE_URL from your existing config/.env via Docker compose
+import os
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@db:5432/postgres")
 
-engine = create_engine(
-    url,
-    pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
-    future=True,
-)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-
-@contextmanager
-def session_scope():
-    db = SessionLocal()
-    try:
-        yield db
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        db.close()
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, future=True)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+Base = declarative_base()
