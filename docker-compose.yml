@@ -27,12 +27,12 @@ services:
       retries: 20
 
   api:
-    environment:
-      - DATABASE_URL=postgresql+psycopg://cgv:cgv@db:5432/cgv
     build:
       context: ./api
     env_file:
       - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
     depends_on:
       db:
         condition: service_healthy
@@ -42,7 +42,11 @@ services:
       - "127.0.0.1:8080:8080"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://localhost:8080/ready"]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/healthz').getcode()==200 else 1)\""
+        ]
       interval: 10s
       timeout: 3s
       retries: 6

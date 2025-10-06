@@ -1,230 +1,191 @@
-from app.routers.notes import router as notes_router
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, EmailStr
 import os
-import psycopg
-# psycopg needs a plain 'postgresql://' DSN (no '+psycopg')
-DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql+psycopg://cgv:cgv@db:5432/cgv')
-DSN = DATABASE_URL.replace('postgresql+psycopg://', 'postgresql://', 1)
-
-from sqlalchemy import text
-from fastapi import FastAPI, Request, Response
-from app.routers import auth, users
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List
-import os
-import time
-import psycopg
 import redis
 
-
-# Prometheus metrics
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from db import get_conn
+from auth import hash_password, verify_password, create_access_token, decode_token
 
 app = FastAPI()
-app.include_router(notes_router, prefix="/notes", tags=["notes"])
 
-# ---------- CORS ----------
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to your frontend origin in prod
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------- connection helpers ----------
-RURL = os.getenv("REDIS_URL", "redis://redis:6379/0")
-_r = redis.from_url(RURL)
-
-# ---------- metrics ----------
-REQUEST_COUNT = Counter(
-    "http_requests_total", "Total HTTP requests", ["method", "path", "status"]
-)
-REQUEST_LATENCY = Histogram(
-    "http_request_duration_seconds", "HTTP request latency", ["method", "path"]
-)
-
-@app.middleware("http")
-async def metrics_middleware(request: Request, call_next):
-    start = time.time()
-    response = None
-    try:
-        response = await call_next(request)
-        return response
-    finally:
-        duration = time.time() - start
-        path = request.url.path
-        method = request.method
-        REQUEST_LATENCY.labels(method, path).observe(duration)
-        status = str(response.status_code if response else 500)
-        REQUEST_COUNT.labels(method, path, status).inc()
-
-@app.get("/metrics")
-def metrics():
-    data = generate_latest()
-    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
-
-# ---------- very simple rate limit (per-IP) ----------
-def ratelimit_ok(ip: str, key: str, limit: int = 120, window_sec: int = 60) -> bool:
-    """
-    Allow up to `limit` hits per `window_sec` per ip:key. Uses Redis INCR + EXPIRE.
-    Fail-open (returns True) if Redis is unavailable.
-    """
-    rk = f"rl:{key}:{ip}"
-    try:
-        hits = _r.incr(rk)
-        if hits == 1:
-            _r.expire(rk, window_sec)
-        return hits <= limit
-    except Exception:
-        return True  # don't block if Redis is down
-
-@app.middleware("http")
-async def basic_rate_limit(request: Request, call_next):
-    path = request.url.path
-    # skip health/metrics/probes
-    if not path.startswith(("/healthz", "/ready", "/metrics", "/dbz", "/cachez")):
-        ip = (request.client.host if request.client else "unknown")
-        if not ratelimit_ok(ip, key="global", limit=120, window_sec=60):
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"detail": "rate limit exceeded"}, status_code=429)
-    return await call_next(request)
-
-# ---------- startup: ensure schema ----------
-
-def ensure_schema():
-    ddl = """
-    CREATE TABLE IF NOT EXISTS notes(
-      id SERIAL PRIMARY KEY,
-      msg TEXT NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT now()
-    );
-    """
-    try:
-        with psycopg.connect(DSN) as conn:
-            with conn.cursor() as cur:
-                cur.execute(ddl)
-    except Exception as e:
-        print("[startup] schema ensure failed:", e)
-
-# ---------- base health ----------
 @app.get("/healthz")
 def health():
     return {"status": "ok"}
 
-# ---------- ready: DB + Redis ----------
-@app.get("/ready")
-def ready():
-    out = {"db": False, "cache": False}
-    try:
-        with psycopg.connect(DSN) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-                _ = cur.fetchone()[0]
-        out["db"] = True
-    except Exception as e:
-        out["db_error"] = str(e)
-    try:
-        out["cache"] = bool(_r.ping())
-    except Exception as e:
-        out["cache_error"] = str(e)
-    out["ok"] = out["db"] and out["cache"]
-    return out
-
-# ---------- quick probes ----------
-@app.get("/dbz")
-def db_probe():
-    try:
-        with psycopg.connect(DSN) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1;")
-                v = cur.fetchone()[0]
-        return {"ok": True, "select1": v}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@app.get("/cachez")
-def cache_probe():
-    try:
-        pong = _r.ping()
-        return {"ok": True, "ping": pong}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# ---------- version ----------
 @app.get("/version")
 def version():
     return {
-        "version": os.getenv("APP_VERSION", "dev"),
         "commit": os.getenv("GIT_COMMIT", "unknown"),
+        "version": os.getenv("APP_VERSION", "0.0.1"),
+        "env": os.getenv("ENVIRONMENT", "dev"),
     }
 
-# ---------- notes endpoints ----------
-class NoteIn(BaseModel):
-    msg: str
+# ---------- Rate limit config ----------
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-class NoteOut(BaseModel):
-    id: int
-    msg: str
-    created_at: str
+LOGIN_MAX_ATTEMPTS    = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
+LOGIN_WINDOW_SECONDS  = int(os.getenv("LOGIN_WINDOW_SECONDS", "600"))   # attempt counter TTL
+LOGIN_LOCK_SECONDS    = int(os.getenv("LOGIN_LOCK_SECONDS", "900"))     # lock duration
 
-@app.post("/notes", response_model=NoteOut)
-def create_note(n: NoteIn):
-    with psycopg.connect(DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO notes(msg) VALUES (%s) RETURNING id, msg, created_at",
-                (n.msg,)
-            )
-            row = cur.fetchone()
-            return {"id": row[0], "msg": row[1], "created_at": row[2].isoformat()}
+def _keys(email: str, ip: str):
+    email = (email or "").lower()
+    ip = ip or "unknown"
+    return {
+        "attempts_email": f"login:attempts:email:{email}",
+        "attempts_ip":    f"login:attempts:ip:{ip}",
+        "lock_email":     f"login:lock:email:{email}",
+        "lock_ip":        f"login:lock:ip:{ip}",
+    }
 
-@app.get("/notes", response_model=List[NoteOut])
-def list_notes(limit: int = 10):
-    with psycopg.connect(DSN) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT id, msg, created_at FROM notes ORDER BY id DESC LIMIT %s",
-                (limit,)
-            )
-            rows = cur.fetchall()
-            return [{"id": r[0], "msg": r[1], "created_at": r[2].isoformat()} for r in rows]
+def is_locked(email: str, ip: str):
+    k = _keys(email, ip)
+    ttl_email = r.ttl(k["lock_email"])
+    ttl_ip    = r.ttl(k["lock_ip"])
+    locked = (ttl_email and ttl_email > 0) or (ttl_ip and ttl_ip > 0)
+    ttl = 0
+    for t in (ttl_email, ttl_ip):
+        if t and t > 0:
+            ttl = t
+            break
+    return locked, ttl
 
-# ---------- simple cache endpoints ----------
-class CacheIn(BaseModel):
-    key: str
-    value: str
-    ttl_seconds: Optional[int] = None
+def register_failure(email: str, ip: str):
+    k = _keys(email, ip)
+    pipe = r.pipeline()
+    pipe.incr(k["attempts_email"])
+    pipe.expire(k["attempts_email"], LOGIN_WINDOW_SECONDS)
+    pipe.incr(k["attempts_ip"])
+    pipe.expire(k["attempts_ip"], LOGIN_WINDOW_SECONDS)
+    cnt_email, _, cnt_ip, _ = pipe.execute()
+    if cnt_email >= LOGIN_MAX_ATTEMPTS or cnt_ip >= LOGIN_MAX_ATTEMPTS:
+        r.setex(k["lock_email"], LOGIN_LOCK_SECONDS, "1")
+        r.setex(k["lock_ip"], LOGIN_LOCK_SECONDS, "1")
+        return True
+    return False
 
-@app.post("/cache")
-def cache_set(c: CacheIn):
-    if c.ttl_seconds:
-        _r.setex(c.key, c.ttl_seconds, c.value)
-    else:
-        _r.set(c.key, c.value)
-    return {"ok": True, "key": c.key}
+def clear_counters(email: str, ip: str):
+    k = _keys(email, ip)
+    r.delete(k["attempts_email"], k["attempts_ip"], k["lock_email"], k["lock_ip"])
 
-@app.get("/cache/{key}")
-def cache_get(key: str):
-    val = _r.get(key)
-    if val is None:
-        return {"ok": False, "key": key, "value": None}
-    return {"ok": True, "key": key, "value": val.decode("utf-8")}
+# ---------- Schemas ----------
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
 
-@app.on_event("startup")
-def ensure_schema():
+class RegisterIn(BaseModel):
+    email: EmailStr
+    password: str
+    role: str = "user"
+
+class MeOut(BaseModel):
+    email: EmailStr
+    role: str
+
+# ---------- Auth dependencies ----------
+bearer = HTTPBearer(auto_error=False)
+
+def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> MeOut:
+    if not creds or creds.scheme.lower() != "bearer":
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    token = creds.credentials
     try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS notes (
-                    id SERIAL PRIMARY KEY,
-                    msg TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """))
-    except Exception as e:
-        print(f"[startup] schema ensure failed: {e}")
+        email, role = decode_token(token)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
-# M4: mount routers
-app.include_router(auth.router)
-app.include_router(users.router)
+    with get_conn() as conn:
+        row = conn.execute("SELECT email, role, is_active FROM users WHERE email=%s", (email,)).fetchone()
+    if not row or not row["is_active"]:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User disabled")
+    return MeOut(email=row["email"], role=row["role"])
+
+def require_admin(user: MeOut = Depends(get_current_user)) -> MeOut:
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin required")
+    return user
+
+# ---------- Admin bootstrap (guarded) ----------
+@app.post("/auth/bootstrap-admin")
+def bootstrap_admin():
+    if os.getenv("ALLOW_BOOTSTRAP", "false").lower() not in ("1","true","yes"):
+        raise HTTPException(status_code=403, detail="Bootstrap disabled")
+    admin_email = os.getenv("ADMIN_EMAIL")
+    admin_pass  = os.getenv("ADMIN_PASSWORD")
+    if not admin_email or not admin_pass:
+        raise HTTPException(status_code=400, detail="Set ADMIN_EMAIL and ADMIN_PASSWORD in env")
+    with get_conn() as conn, conn.cursor() as cur:
+        row = conn.execute("SELECT id FROM users WHERE email=%s", (admin_email,)).fetchone()
+        if row:
+            return {"status": "exists", "email": admin_email}
+        cur.execute(
+            "INSERT INTO users (email, password_hash, role, is_active) VALUES (%s,%s,'admin',TRUE)",
+            (admin_email, hash_password(admin_pass))
+        )
+        conn.commit()
+    return {"status": "created", "email": admin_email}
+
+# ---------- Login with rate-limit ----------
+@app.post("/auth/login")
+def login(body: LoginIn, request: Request):
+    ip = request.client.host if request and request.client else "unknown"
+
+    locked, ttl = is_locked(body.email, ip)
+    if locked:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many failed attempts. Try again in {ttl} seconds."
+        )
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT email, password_hash, role, is_active FROM users WHERE email=%s",
+            (body.email,)
+        ).fetchone()
+
+    if not row or not row["is_active"] or not verify_password(body.password, row["password_hash"]):
+        just_locked = register_failure(body.email, ip)
+        if just_locked:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Too many failed attempts. Locked for {LOGIN_LOCK_SECONDS} seconds."
+            )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+    clear_counters(body.email, ip)
+    token = create_access_token(row["email"], row["role"])
+    return {"access_token": token, "token_type": "bearer"}
+
+# ---------- Register (admin only) ----------
+@app.post("/auth/register")
+def register(body: RegisterIn, admin: MeOut = Depends(require_admin)):
+    if body.role not in ("user", "admin"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+    with get_conn() as conn, conn.cursor() as cur:
+        exists = conn.execute("SELECT 1 FROM users WHERE email=%s", (body.email,)).fetchone()
+        if exists:
+            raise HTTPException(status_code=409, detail="Email already exists")
+        cur.execute(
+            "INSERT INTO users (email, password_hash, role, is_active) VALUES (%s,%s,%s,TRUE)",
+            (body.email, hash_password(body.password), body.role)
+        )
+        conn.commit()
+    return {"status": "created", "email": str(body.email), "role": body.role}
+
+# ---------- Who am I ----------
+@app.get("/me", response_model=MeOut)
+def me(user: MeOut = Depends(get_current_user)):
+    return user
+
+# ---------- Admin unlock (clears email + current caller IP) ----------
+@app.post("/auth/unlock")
+def unlock(email: EmailStr, request: Request, admin: MeOut = Depends(require_admin)):
+    ip = request.client.host if request and request.client else None
+    # always clear email counters/locks
+    r.delete(f"login:attempts:email:{str(email).lower()}",
+             f"login:lock:email:{str(email).lower()}")
+    # optionally clear this IP too (useful in dev)
+    if ip:
+        r.delete(f"login:attempts:ip:{ip}", f"login:lock:ip:{ip}")
+    return {"status": "unlocked", "email": str(email), "cleared_ip": ip}
