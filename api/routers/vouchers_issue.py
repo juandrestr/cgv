@@ -5,16 +5,26 @@ from datetime import datetime, timedelta, timezone
 import os, json, base64, re
 import psycopg
 import psycopg.errors
+import redis
 
 # ---------- env knobs ----------
 VOUCHER_CODE_LENGTH = int(os.getenv("VOUCHER_CODE_LENGTH", "16"))
 VOUCHER_DEFAULT_CURRENCY = os.getenv("VOUCHER_DEFAULT_CURRENCY", "ZAR")
 VOUCHER_DEFAULT_EXPIRY_DAYS = int(os.getenv("VOUCHER_DEFAULT_EXPIRY_DAYS", "183"))
 VOUCHER_MAX_FACE_CENTS = int(os.getenv("VOUCHER_MAX_FACE_CENTS", "50000"))  # R500 default max
+VOUCHER_ISSUE_RATE_PER_MIN = int(os.getenv("VOUCHER_ISSUE_RATE_PER_MIN", "30"))  # per issuer/min
 
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL not set")
+
+_r = None
+def _redis():
+    global _r
+    if _r is None:
+        _r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    return _r
 
 def pg():
     return psycopg.connect(DATABASE_URL, autocommit=False)
@@ -40,7 +50,6 @@ def _get_user(creds: HTTPAuthorizationCredentials = Depends(_bearer)) -> dict:
     payload = _decode_jwt_payload(creds.credentials)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid token")
-    # JWT sub may be email or uuid; we will resolve to users.user_uuid
     uid_or_email = payload.get("sub") or payload.get("user_uuid") or payload.get("uid")
     role = (payload.get("role") or "").lower()
     if not uid_or_email:
@@ -65,6 +74,21 @@ def _resolve_user_uuid(conn, principal: str) -> str:
         if not row or not row[0]:
             raise HTTPException(status_code=401, detail="Issuer not recognized")
         return str(row[0])
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _rate_limit_issue(issuer_uuid: str):
+    """Simple per-issuer per-minute throttle with Redis."""
+    r = _redis()
+    bucket = _now_utc().strftime("%Y%m%d%H%M")
+    key = f"rl:issue:{issuer_uuid}:{bucket}"
+    pipe = r.pipeline()
+    pipe.incr(key, 1)
+    pipe.expire(key, 70)
+    count, _ = pipe.execute()
+    if count > VOUCHER_ISSUE_RATE_PER_MIN:
+        raise HTTPException(status_code=429, detail="Issuance rate limit exceeded. Please retry in a minute.")
 
 # ---------- models ----------
 class IssueIn(BaseModel):
@@ -92,9 +116,6 @@ def _gen_code(n: int) -> str:
     import secrets
     return "".join(_ALNUM[secrets.randbelow(len(_ALNUM))] for _ in range(n))
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
 def _fmt_money_zar(cents: int) -> str:
     rands = cents / 100.0
     return f"R{rands:,.2f}".replace(",", " ").replace(" ", "")
@@ -117,6 +138,10 @@ def issue_voucher(body: IssueIn, user=Depends(_get_user)):
 
     with pg() as conn:
         issuer_uuid = _resolve_user_uuid(conn, user['principal'])
+
+        # Throttle per issuer/minute
+        _rate_limit_issue(issuer_uuid)
+
         with conn.cursor() as cur:
             # Idempotency: if issuer+idem+face already issued an active code, return it
             if idem:
@@ -185,6 +210,33 @@ def issue_voucher(body: IssueIn, user=Depends(_get_user)):
                         raise
                     conn.rollback()
                     cur = conn.cursor()
+
+            # Try to write an audit event (non-fatal if it fails)
+            try:
+                # Your voucher_events schema: subject_type, subject_id, action, actor_user_id, payload
+                cur.execute("""
+                    INSERT INTO voucher_events (subject_type, subject_id, action, actor_user_id, payload)
+                    VALUES (
+                        'voucher', %s, 'issued', %s,
+                        jsonb_strip_nulls(jsonb_build_object(
+                          'idempotency_key', %s::text,
+                          'retailer_id', %s::text,
+                          'outlet_id', %s::text,
+                          'cashier_id', %s::text,
+                          'till_ref', %s::text,
+                          'provider', %s::text,
+                          'provider_txn_id', %s::text,
+                          'face_value_cents', %s,
+                          'currency', %s::text
+                        ))
+                    )
+                """, (v_id, issuer_uuid,
+                      idem,
+                      body.retailer_id, body.outlet_id, body.cashier_id, body.till_ref,
+                      body.provider, body.provider_txn_id,
+                      face, currency))
+            except Exception:
+                pass
 
             conn.commit()
 
