@@ -125,6 +125,22 @@ def redeem_self(
                     ON CONFLICT (user_id) DO NOTHING
                 """, (user_id_int, currency))
 
+                # If already redeemed, don't credit again
+                if state != 'ISSUED':
+                    cur2 = conn.cursor()
+                    cur2.execute("SELECT balance_cents FROM wallets WHERE user_id=%s", (user_id_int,))
+                    wb = cur2.fetchone()
+                    wallet_balance = wb[0] if wb else 0
+                    return RedeemOut(
+                        code=vcode,
+                        credited_cents=amount_cents,
+                        currency=currency,
+                        wallet_balance_cents=wallet_balance,
+                        state=state,
+                        redeemed_at=redeemed_at or now
+                    )
+
+
                 # Idempotent ledger insert (wallet_ledger.user_id is UUID -> users.user_uuid)
                 try:
                     cur.execute("""
