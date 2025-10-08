@@ -17,10 +17,8 @@ ENV PYTHONUNBUFFERED=1
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
 
-# --- safety patch: fix relative import in vouchers_redeem.py at build-time ---
 RUN for f in /app/routers/vouchers_redeem.py /app/api/routers/vouchers_redeem.py; do \
   if [ -f "$f" ]; then \
     sed -i "s/from \.\.rate_limit import throttle/from rate_limit import throttle/g" "$f"; \
     sed -i "s/from routers\.rate_limit import throttle/from rate_limit import throttle/g" "$f"; \
   fi; \
-done
