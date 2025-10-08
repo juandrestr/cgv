@@ -1,4 +1,3 @@
-from routers import vouchers_issue
 import rbac_m7
 from fastapi.routing import APIRoute
 import psycopg
@@ -15,9 +14,7 @@ from db import get_conn
 from auth import hash_password, verify_password, create_access_token, decode_token
 
 app = FastAPI()
-app.include_router(vouchers_issue.router)
 from routers.vouchers import router as vouchers_router
-app.include_router(vouchers_router)
 
 
 
@@ -39,7 +36,7 @@ def _m7_db():
 def _m7_is_admin(email: str) -> bool:
     if not email: return False
     with _m7_db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT is_admin FROM users WHERE user_uuid=%s LIMIT 1;", (email,))
+        cur.execute("SELECT is_admin FROM users WHERE email=%s LIMIT 1;", (email,))
         row = cur.fetchone()
         return bool(row and row[0])
 
@@ -148,7 +145,7 @@ def get_current_user(creds: HTTPAuthorizationCredentials = Depends(bearer)) -> M
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
 
     with get_conn() as conn:
-        row = conn.execute("SELECT email, role, is_active FROM users WHERE user_uuid=%s", (email,)).fetchone()
+        row = conn.execute("SELECT email, role, is_active FROM users WHERE email=%s", (email,)).fetchone()
     if not row or not row["is_active"]:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User disabled")
     return MeOut(email=row["email"], role=row["role"])
@@ -168,7 +165,7 @@ def bootstrap_admin():
     if not admin_email or not admin_pass:
         raise HTTPException(status_code=400, detail="Set ADMIN_EMAIL and ADMIN_PASSWORD in env")
     with get_conn() as conn, conn.cursor() as cur:
-        row = conn.execute("SELECT id FROM users WHERE user_uuid=%s", (admin_email,)).fetchone()
+        row = conn.execute("SELECT id FROM users WHERE email=%s", (admin_email,)).fetchone()
         if row:
             return {"status": "exists", "email": admin_email}
         cur.execute(
@@ -192,7 +189,7 @@ def login(body: LoginIn, request: Request):
 
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT email, password_hash, role, is_active FROM users WHERE user_uuid=%s",
+            "SELECT email, password_hash, role, is_active FROM users WHERE email=%s",
             (body.email,)
         ).fetchone()
 
@@ -223,7 +220,7 @@ def register(body: RegisterIn, admin: MeOut = Depends(require_admin)):
     if body.role not in ("user", "admin"):
         raise HTTPException(status_code=400, detail="Invalid role")
     with get_conn() as conn, conn.cursor() as cur:
-        exists = conn.execute("SELECT 1 FROM users WHERE user_uuid=%s", (body.email,)).fetchone()
+        exists = conn.execute("SELECT 1 FROM users WHERE email=%s", (body.email,)).fetchone()
         if exists:
             raise HTTPException(status_code=409, detail="Email already exists")
         cur.execute(
@@ -713,7 +710,7 @@ def get_current_user_proxy(creds: HTTPAuthorizationCredentials = Depends(bearer)
     with psycopg.connect(os.getenv("DATABASE_URL", "postgresql://cgv:cgv@db:5432/cgv"),
                          autocommit=True) as conn, \
          conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
-        cur.execute("SELECT user_uuid::text AS id, role FROM users WHERE user_uuid=%s", (sub,))
+        cur.execute("SELECT user_uuid::text AS id, role FROM users WHERE email=%s", (sub,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="User not found")
@@ -819,3 +816,10 @@ def _otp_del(phone: str):
     if r is not None and hasattr(r, "delete"):
         r.delete(f"otp:{phone}")
 # ======== /M8C HOTFIX ========
+
+# --- M10: mount routers after get_current_user to avoid circular import ---
+from routers import vouchers_redeem, wallets
+from routers import vouchers_issue
+app.include_router(vouchers_issue.router)
+app.include_router(vouchers_redeem.router)
+app.include_router(wallets.router)
